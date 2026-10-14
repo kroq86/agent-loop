@@ -1,4 +1,4 @@
-"""flow-xray tracing when it is installed (`pip install agent-loop[trace]`),
+"""flow-xray tracing when it is installed (`pip install agent-runloop[trace]`),
 otherwise a no-op with the same surface."""
 from __future__ import annotations
 

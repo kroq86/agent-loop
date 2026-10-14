@@ -2,7 +2,7 @@
 captured as a flow-xray trace.
 
     ollama pull llama3.2:3b
-    pip install "agent-loop[trace]"
+    pip install "agent-runloop[trace]"
     python examples/patterns.py            # traces in ./traces, report at the end
 """
 from __future__ import annotations

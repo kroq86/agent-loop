@@ -1,4 +1,6 @@
-# agent-loop
+# agent-runloop
+
+`pip install agent-runloop`, then `import agent_loop`.
 
 An explicit agent loop for tool-using LLM agents, and blocks to compose
 agents into routers, waterfalls, parallel fan-outs, handoffs and
@@ -19,8 +21,8 @@ call, tool exception) becomes an observation the model sees on its next
 turn. None of them execute anything.
 
 ```bash
-pip install agent-loop            # core: pydantic only
-pip install "agent-loop[trace]"   # + flow-xray call-tree tracing
+pip install agent-runloop         # core: pydantic only
+pip install "agent-runloop[trace]"   # + flow-xray call-tree tracing
 ```
 
 Python 3.11+.
@@ -185,7 +187,7 @@ retries and a circuit breaker.
 
 ## Observability
 
-- **flow-xray**: with `agent-loop[trace]` installed, `run_agent`, each tool
+- **flow-xray**: with `agent-runloop[trace]` installed, `run_agent`, each tool
   execution, each composite block and each model call become nodes in a
   flow-xray call tree, with inputs, outputs, tokens and latency.
 - **Step events**: by default they go to the `agent_loop` logger at
