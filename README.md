@@ -181,9 +181,40 @@ async def generate(self, messages, format=None, options=None, trace_id=None) -> 
 
 `format` is a JSON schema the reply must follow. A backend should report
 tokens with `agent_loop.usage.add(prompt, completion)`, or `max_tokens`
-is not enforced. `agent_loop.ollama.OllamaBackend` is a dependency-free
-reference backend with no retries. For production, wrap your client with
-retries and a circuit breaker.
+is not enforced. Two are included.
+
+**OpenAI-compatible APIs** (`pip install "agent-runloop[openai]"`): OpenAI,
+Azure OpenAI, and servers that speak the same protocol (vLLM, LM Studio,
+OpenRouter, llama.cpp server, Ollama's `/v1`).
+
+```python
+from agent_loop.openai import AzureOpenAIBackend, OpenAIBackend
+
+OpenAIBackend("gpt-4.1-mini")                                    # OPENAI_API_KEY
+OpenAIBackend("llama3.2:3b", base_url="http://127.0.0.1:11434/v1", api_key="unused")
+AzureOpenAIBackend("my-deployment", endpoint="https://<resource>.openai.azure.com")  # AZURE_OPENAI_API_KEY
+AzureOpenAIBackend("my-deployment", endpoint=..., token_provider=get_token)        # Entra ID, refreshed per call
+```
+
+- **Retries.** Only what can succeed on a second try is retried:
+  connection errors, timeouts, 429 and 5xx. The wait honours
+  `Retry-After` and `retry-after-ms`, otherwise it is exponential backoff
+  with jitter. Any other 4xx fails at once with `ModelRequestError`.
+- **Circuit breaker.** After `breaker_threshold` consecutive failed calls,
+  every call fails fast with `ModelUnavailable` for `breaker_reset_s`.
+  Then one trial call decides whether it closes. The breaker is per
+  backend instance and per process.
+- **Structured output.** The loop's schema is sent as a `json_schema`
+  response format. Use `structured="json_object"` for servers that only
+  support JSON mode, or `"none"`.
+- **Tokens.** Usage from each response feeds the run's token budget and
+  the flow-xray trace.
+
+Inside a run, an unavailable model ends the run as `model_unavailable`
+with its state saved. It does not crash the loop.
+
+**Ollama** (`agent_loop.ollama.OllamaBackend`) is a dependency-free
+reference backend with no retries.
 
 ## Observability
 

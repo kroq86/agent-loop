@@ -4,10 +4,17 @@ captured as a flow-xray trace.
     ollama pull llama3.2:3b
     pip install "agent-runloop[trace]"
     python examples/patterns.py            # traces in ./traces, report at the end
+
+Through an OpenAI-compatible API instead (any provider, or Ollama's /v1):
+
+    pip install "agent-runloop[trace,openai]"
+    AGENT_BACKEND=openai OPENAI_MODEL=llama3.2:3b OPENAI_BASE_URL=http://127.0.0.1:11434/v1 \
+        OPENAI_API_KEY=unused python examples/patterns.py
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import sys
 import tempfile
@@ -138,7 +145,12 @@ async def main() -> int:
     except ImportError:
         TraceStore = None
     store = TraceStore(Path("traces"), max_llm_calls=12) if TraceStore else None
-    backend = OllamaBackend("llama3.2:3b")
+    if os.getenv("AGENT_BACKEND") == "openai":
+        from agent_loop.openai import OpenAIBackend
+        backend = OpenAIBackend(os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+    else:
+        backend = OllamaBackend("llama3.2:3b")
+    print(f"backend: {type(backend).__name__} {backend.model}")
     runs_db = str(Path(tempfile.mkdtemp()) / "runs.sqlite3")
     failed = 0
     for name, block, task, expect in scenarios():
