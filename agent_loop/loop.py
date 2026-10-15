@@ -244,12 +244,24 @@ def tool_error(code: str, message: str) -> str:
     return json.dumps({"error": {"code": code, "message": message}})
 
 
+class ToolTimeout(Exception):
+    """A tool exceeded its own `timeout_s`. Deliberately not a TimeoutError:
+    that one means the RUN's deadline, which ends the run. A slow tool is a
+    tool failure the model sees and can work around."""
+
+
 @trace
 async def execute_tool(spec: ToolSpec, args: BaseModel, trace_id: str) -> Any:
     """Separate traced node so trace.html shows each tool's validated
     arguments and full result, under the run_agent node."""
     trace.meta(tool=spec.name, arguments=args.model_dump(), tool_version=spec.version)
-    return await asyncio.wait_for(spec.handler(args, trace_id), timeout=spec.timeout_s)
+    try:
+        return await asyncio.wait_for(spec.handler(args, trace_id), timeout=spec.timeout_s)
+    except TimeoutError:
+        # Only the tool's own timeout lands here: when the run's deadline
+        # fires, the wait is cancelled instead, and that surfaces as the
+        # run's TimeoutError one level up.
+        raise ToolTimeout(f"{spec.name} did not finish within its timeout of {spec.timeout_s}s") from None
 
 
 async def _execute(state: "_RunState", spec: ToolSpec, args: BaseModel, canonical: dict,
