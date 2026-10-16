@@ -28,6 +28,7 @@ import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
@@ -265,12 +266,13 @@ async def execute_tool(spec: ToolSpec, args: BaseModel, trace_id: str) -> Any:
 
 
 async def _execute(state: "_RunState", spec: ToolSpec, args: BaseModel, canonical: dict,
-                   run_store: SqliteAgentRunStore | None) -> Any:
+                   run_store: SqliteAgentRunStore | None, *, detail: str | None = None,
+                   prefetch: bool = False) -> Any:
     """Authorize, execute with a stable call id, and write the audit row --
     success or failure. Raises the tool's exception after auditing it."""
     if spec.authorize is not None and not spec.authorize(state.context):
         if run_store is not None:
-            run_store.audit(state, spec.name, spec.version, canonical, "not_permitted", 0.0, None)
+            await run_store.aaudit(state, spec.name, spec.version, canonical, "not_permitted", 0.0, None)
         raise PermissionError(f"{spec.name} is not permitted for this caller")
     call_id = f"{state.run_id}:{hashlib.sha256(_call_key(spec.name, canonical).encode()).hexdigest()[:16]}"
     token = current_call_id.set(call_id)
@@ -279,13 +281,23 @@ async def _execute(state: "_RunState", spec: ToolSpec, args: BaseModel, canonica
         output = await execute_tool(spec, args, state.trace_id)
     except Exception as e:
         if run_store is not None:
-            run_store.audit(state, spec.name, spec.version, canonical, "error",
+            await run_store.aaudit(state, spec.name, spec.version, canonical, "error",
                             time.monotonic() - start, f"{type(e).__name__}: {e}")
         raise
     finally:
         current_call_id.reset(token)
+    # Preserve a completed effect/observation BEFORE the new audit await.
+    # Cancellation during its commit must not erase the tool's full result.
+    key = _call_key(spec.name, canonical)
+    if key not in state.executed:
+        state.executed.append(key)
+    if prefetch:
+        state.usage["tool_calls"] += 1
+    _record(state, AgentStep(state.iteration, "tool_call", tool=spec.name, arguments=canonical,
+                             detail=detail, output=output),
+            json.dumps({"tool": spec.name, "result": output}, default=str))
     if run_store is not None:
-        run_store.audit(state, spec.name, spec.version, canonical, "ok", time.monotonic() - start, None)
+        await run_store.aaudit(state, spec.name, spec.version, canonical, "ok", time.monotonic() - start, None)
     return output
 
 
@@ -344,12 +356,13 @@ async def run_agent(
     token = _events.set(events)
     try:
         with bind_trace(trace_id):
-            log_step(trace_id, "agent_started", run_id=state.run_id, tools=sorted(registry),
-                     write_tools=write_tools, budget=state.budget, versions=state.versions)
-            _emit(state, {"event": "started", "run_id": state.run_id})
-            for tool_name, arguments in prefetch or []:
-                await _prefetch(state, registry, tool_name, arguments, run_store)
-            return await _drive(state, registry, backend, final_check, run_store)
+            async with _persist_cancellation(state, run_store):
+                log_step(trace_id, "agent_started", run_id=state.run_id, tools=sorted(registry),
+                         write_tools=write_tools, budget=state.budget, versions=state.versions)
+                _emit(state, {"event": "started", "run_id": state.run_id})
+                for tool_name, arguments in prefetch or []:
+                    await _prefetch(state, registry, tool_name, arguments, run_store)
+                return await _drive(state, registry, backend, final_check, run_store)
     finally:
         _events.reset(token)
 
@@ -367,46 +380,42 @@ async def resume_agent(
     """Continue a run paused at awaiting_approval. Raises LookupError for
     an unknown run and RuntimeError if the run is not (or no longer)
     awaiting approval -- e.g. a second approve for the same run."""
-    loaded = run_store.load(run_id)
+    loaded = await run_store.aload(run_id)
     if loaded is None:
         raise LookupError(f"unknown run {run_id}")
-    if not run_store.claim_for_resume(run_id):
-        raise RuntimeError(f"run {run_id} is not awaiting approval (status: {run_store.load(run_id)[0]})")
+    if not await run_store.aclaim_for_resume(run_id):
+        raise RuntimeError(f"run {run_id} is not awaiting approval (status: {(await run_store.aload(run_id))[0]})")
     state = _RunState.from_dict(loaded[1])
     registry = _registry(tools)
     pending = state.pending
     token = _events.set(events)
     try:
         with bind_trace(state.trace_id):
-            log_step(state.trace_id, "agent_resumed", run_id=run_id, approved=approved, tool=pending["tool"])
-            spec = registry[pending["tool"]]
-            args = spec.args_model.model_validate(pending["arguments"])
-            state.pending = None
-            if approved:
-                if state.usage["tool_calls"] >= state.budget["max_tool_calls"]:
-                    _record(state, AgentStep(pending["iteration"], "budget_exceeded", tool=spec.name,
-                                             detail=f"max_tool_calls={state.budget['max_tool_calls']}"))
-                    return _finish(state, "budget_exceeded", None, run_store)
-                state.usage["tool_calls"] += 1
-                try:
-                    output = await _execute(state, spec, args, pending["arguments"], run_store)
-                except Exception as e:
-                    detail = f"{type(e).__name__}: {e}"
-                    kind = "not_permitted" if isinstance(e, PermissionError) else "tool_error"
-                    _record(state, AgentStep(pending["iteration"], kind, tool=spec.name,
-                                             arguments=pending["arguments"], detail=detail),
-                            tool_error(kind, f"{spec.name} failed after approval: {detail}"))
+            async with _persist_cancellation(state, run_store):
+                log_step(state.trace_id, "agent_resumed", run_id=run_id, approved=approved, tool=pending["tool"])
+                spec = registry[pending["tool"]]
+                args = spec.args_model.model_validate(pending["arguments"])
+                state.pending = None
+                if approved:
+                    if state.usage["tool_calls"] >= state.budget["max_tool_calls"]:
+                        _record(state, AgentStep(pending["iteration"], "budget_exceeded", tool=spec.name,
+                                                 detail=f"max_tool_calls={state.budget['max_tool_calls']}"))
+                        return await _finish(state, "budget_exceeded", None, run_store)
+                    state.usage["tool_calls"] += 1
+                    try:
+                        await _execute(state, spec, args, pending["arguments"], run_store, detail="approved by human")
+                    except Exception as e:
+                        detail = f"{type(e).__name__}: {e}"
+                        kind = "not_permitted" if isinstance(e, PermissionError) else "tool_error"
+                        _record(state, AgentStep(pending["iteration"], kind, tool=spec.name,
+                                                 arguments=pending["arguments"], detail=detail),
+                                tool_error(kind, f"{spec.name} failed after approval: {detail}"))
                 else:
-                    _record(state, AgentStep(pending["iteration"], "tool_call", tool=spec.name,
-                                             arguments=pending["arguments"], detail="approved by human",
-                                             output=output),
-                            json.dumps({"tool": spec.name, "result": output}, default=str))
-            else:
-                _record(state, AgentStep(pending["iteration"], "human_rejected", tool=spec.name,
-                                         arguments=pending["arguments"], detail="rejected by human"),
-                        f"A human reviewer rejected the {spec.name} call; it was not executed. "
-                        "Do not propose it again. Tell the user it was not done.")
-            return await _drive(state, registry, backend, final_check, run_store)
+                    _record(state, AgentStep(pending["iteration"], "human_rejected", tool=spec.name,
+                                             arguments=pending["arguments"], detail="rejected by human"),
+                            f"A human reviewer rejected the {spec.name} call; it was not executed. "
+                            "Do not propose it again. Tell the user it was not done.")
+                return await _drive(state, registry, backend, final_check, run_store)
     finally:
         _events.reset(token)
 
@@ -422,15 +431,16 @@ async def recover_agent(
     """Continue a run whose process died mid-run (status "running", lease
     expired) from its last checkpoint. RuntimeError if it is not orphaned
     -- still leased by a live process, or not running at all."""
-    if run_store.load(run_id) is None:
+    if await run_store.aload(run_id) is None:
         raise LookupError(f"unknown run {run_id}")
-    if not run_store.claim_orphaned(run_id):
-        raise RuntimeError(f"run {run_id} is not an orphaned running run (status: {run_store.load(run_id)[0]})")
-    state = _RunState.from_dict(run_store.load(run_id)[1])
+    if not await run_store.aclaim_orphaned(run_id):
+        raise RuntimeError(f"run {run_id} is not an orphaned running run (status: {(await run_store.aload(run_id))[0]})")
+    state = _RunState.from_dict((await run_store.aload(run_id))[1])
     with bind_trace(state.trace_id):
-        log_step(state.trace_id, "agent_recovered", run_id=run_id, from_iteration=state.iteration,
-                 usage=state.usage)
-        return await _drive(state, _registry(tools), backend, final_check, run_store)
+        async with _persist_cancellation(state, run_store):
+            log_step(state.trace_id, "agent_recovered", run_id=run_id, from_iteration=state.iteration,
+                     usage=state.usage)
+            return await _drive(state, _registry(tools), backend, final_check, run_store)
 
 
 async def _prefetch(state: "_RunState", registry: dict[str, ToolSpec], tool_name: str, arguments: dict,
@@ -441,22 +451,23 @@ async def _prefetch(state: "_RunState", registry: dict[str, ToolSpec], tool_name
     args = spec.args_model.model_validate(arguments)
     canonical = args.model_dump(mode="json")
     try:
-        output = await _execute(state, spec, args, canonical, run_store)
+        await _execute(state, spec, args, canonical, run_store, detail="prefetched", prefetch=True)
     except Exception as e:
         _record(state, AgentStep(0, "tool_error", tool=spec.name, arguments=canonical,
                                  detail=f"prefetched: {type(e).__name__}: {e}"),
                 tool_error("tool_error", f"{spec.name} failed: {type(e).__name__}: {e}"))
         return
-    state.usage["tool_calls"] += 1
-    state.executed.append(_call_key(spec.name, canonical))
-    _record(state, AgentStep(0, "tool_call", tool=spec.name, arguments=canonical, detail="prefetched", output=output),
-            json.dumps({"tool": spec.name, "result": output}, default=str))
 
 
 def cancel_agent(run_id: str, run_store: SqliteAgentRunStore) -> bool:
     """Cancel a run that is waiting for approval. False if it is not
     waiting (already decided, running, finished)."""
     return run_store.cancel_if_waiting(run_id)
+
+
+async def acancel_agent(run_id: str, run_store: SqliteAgentRunStore) -> bool:
+    """Async form of cancel_agent; await the complete compare-and-set write."""
+    return await run_store.acancel_if_waiting(run_id)
 
 
 def _emit(state: _RunState, event: dict) -> None:
@@ -475,14 +486,38 @@ def _record(state: _RunState, step: AgentStep, observation: str | None = None) -
         state.messages.append(_observation(observation, state.task))
 
 
-def _finish(state: _RunState, status: Status, answer: str | None,
+@asynccontextmanager
+async def _persist_cancellation(state: _RunState, run_store: SqliteAgentRunStore | None):
+    try:
+        yield
+    except _FinishedDuringCancellation:
+        raise
+    except asyncio.CancelledError:
+        _record(state, AgentStep(state.iteration, "cancelled", detail="run task cancelled"))
+        await _finish(state, "cancelled", None, run_store)
+        raise
+
+
+class _FinishedDuringCancellation(asyncio.CancelledError):
+    """The final save committed; cancellation must not overwrite its status."""
+
+
+async def _finish(state: _RunState, status: Status, answer: str | None,
             run_store: SqliteAgentRunStore | None, citations: list[str] | None = None) -> AgentResult:
+    cancelled = False
     if run_store is not None:
-        run_store.save(state.run_id, status, state.to_dict())
+        try:
+            await run_store.asave(state.run_id, status, state.to_dict())
+        except asyncio.CancelledError:
+            # asave only propagates caller cancellation AFTER a successful
+            # operation. A write error propagates as that error instead.
+            cancelled = True
     log_step(state.trace_id, "agent_finished", run_id=state.run_id, status=status, iterations=state.iteration,
              usage=state.usage, versions=state.versions)
     trace.meta(status=status, iterations=state.iteration, run_id=state.run_id, usage=dict(state.usage))
     _emit(state, {"event": "finished", "status": status})
+    if cancelled:
+        raise _FinishedDuringCancellation()
     return AgentResult(status=status, answer=answer, trace_id=state.trace_id, steps=list(state.steps),
                        run_id=state.run_id, citations=citations or [], versions=dict(state.versions),
                        usage=dict(state.usage),
@@ -501,12 +536,11 @@ async def _drive(state: _RunState, registry: dict[str, ToolSpec], backend: LLMBa
         try:
             return await _drive_segment(state, registry, backend, final_check, run_store, meter,
                                         segment_start, seconds_before, tokens_before)
+        except _FinishedDuringCancellation:
+            raise
         except asyncio.CancelledError:
-            # Client went away (SSE disconnect) or the server is shutting
-            # down: persist what happened so far, then let cancellation go on.
             state.usage["seconds"] = round(seconds_before + time.monotonic() - segment_start, 2)
-            _record(state, AgentStep(state.iteration, "cancelled", detail="run task cancelled"))
-            _finish(state, "cancelled", None, run_store)
+            state.usage["tokens"] = tokens_before + meter["prompt_tokens"] + meter["completion_tokens"]
             raise
 
 
@@ -522,20 +556,20 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
         state.usage["seconds"] = round(used_seconds(), 2)
         state.usage["tokens"] = tokens_before + meter["prompt_tokens"] + meter["completion_tokens"]
 
-    def out_of_time() -> AgentResult:
+    async def out_of_time() -> AgentResult:
         sync_usage()
         _record(state, AgentStep(state.iteration, "timeout", detail=f"max_seconds={budget['max_seconds']}"))
-        return _finish(state, "timeout", None, run_store)
+        return await _finish(state, "timeout", None, run_store)
 
     while state.iteration < state.max_iterations:
         if used_seconds() >= budget["max_seconds"]:
-            return out_of_time()
+            return await out_of_time()
         sync_usage()
         if run_store is not None:
             # Checkpoint before every model turn, with a lease: if this
             # process dies, the run stays "running" until the lease expires
             # and recover_agent() continues it from here.
-            run_store.checkpoint(state.run_id, state.to_dict())
+            await run_store.acheckpoint(state.run_id, state.to_dict())
         state.iteration += 1
         iteration = state.iteration
         try:
@@ -547,7 +581,7 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
                     trace_id=trace_id,
                 )
         except TimeoutError:
-            return out_of_time()
+            return await out_of_time()
         except Exception as e:
             # A model failure is not a tool failure: there is nobody to
             # show an observation to. The backend already retried; the run
@@ -555,14 +589,14 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
             # (e.g. to HTTP 503).
             sync_usage()
             _record(state, AgentStep(iteration, "model_error", detail=f"{type(e).__name__}: {str(e)[:300]}"))
-            return _finish(state, "model_unavailable", None, run_store)
+            return await _finish(state, "model_unavailable", None, run_store)
         sync_usage()
         state.messages.append({"role": "assistant", "content": raw})
         log_step(trace_id, "agent_model_reply", iteration=iteration, raw=raw[:500], usage=state.usage)
         if state.usage["tokens"] > budget["max_tokens"]:
             _record(state, AgentStep(iteration, "budget_exceeded",
                                      detail=f"tokens {state.usage['tokens']} > max_tokens={budget['max_tokens']}"))
-            return _finish(state, "budget_exceeded", None, run_store)
+            return await _finish(state, "budget_exceeded", None, run_store)
 
         try:
             data = json.loads(raw)
@@ -584,9 +618,9 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
                 # Not fed back for another try: a rejected answer ends the
                 # run, and the caller decides what the user sees.
                 _record(state, AgentStep(iteration, "final_rejected", detail=f"{rejection} | answer: {decision.answer}"))
-                return _finish(state, "rejected_final", None, run_store)
+                return await _finish(state, "rejected_final", None, run_store)
             _record(state, AgentStep(iteration, "final", detail=f"citations: {decision.citations}"))
-            return _finish(state, "answered", decision.answer, run_store, decision.citations)
+            return await _finish(state, "answered", decision.answer, run_store, decision.citations)
 
         spec = registry.get(decision.tool)
         if spec is None:
@@ -617,7 +651,7 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
         if state.usage["tool_calls"] >= budget["max_tool_calls"]:
             _record(state, AgentStep(iteration, "budget_exceeded", tool=spec.name,
                                      detail=f"max_tool_calls={budget['max_tool_calls']}"))
-            return _finish(state, "budget_exceeded", None, run_store)
+            return await _finish(state, "budget_exceeded", None, run_store)
         if spec.precondition is not None:
             reason = spec.precondition(canonical, state.task)
             if reason is not None:
@@ -631,7 +665,7 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
             # this caller may not take, and nothing executes.
             state.executed.append(key)
             if run_store is not None:
-                run_store.audit(state, spec.name, spec.version, canonical, "not_permitted", 0.0, None)
+                await run_store.aaudit(state, spec.name, spec.version, canonical, "not_permitted", 0.0, None)
             _record(state, AgentStep(iteration, "not_permitted", tool=spec.name, arguments=canonical,
                                      detail=spec.denied_message),
                     tool_error("not_permitted", f"{spec.name}: {spec.denied_message}"))
@@ -644,14 +678,14 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
             state.pending = {"tool": spec.name, "arguments": canonical, "iteration": iteration}
             _record(state, AgentStep(iteration, "approval_requested", tool=spec.name, arguments=canonical,
                                      detail="write tool: paused for human approval"))
-            return _finish(state, "awaiting_approval", None, run_store)
+            return await _finish(state, "awaiting_approval", None, run_store)
 
         state.usage["tool_calls"] += 1
         try:
             async with asyncio.timeout(max(0.001, budget["max_seconds"] - used_seconds())):
-                output = await _execute(state, spec, args, canonical, run_store)
+                await _execute(state, spec, args, canonical, run_store)
         except TimeoutError:
-            return out_of_time()
+            return await out_of_time()
         except Exception as e:  # any tool failure is an observation, never a crash of the loop
             detail = f"{type(e).__name__}: {e}"
             kind = "not_permitted" if isinstance(e, PermissionError) else "tool_error"
@@ -659,11 +693,6 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
                     tool_error(kind, f"{spec.name} failed: {detail}"))
             continue
 
-        # Marked executed only once it has a result: a run recovered after a
-        # crash mid-tool must be able to call it again, not see a "duplicate".
-        state.executed.append(key)
-        _record(state, AgentStep(iteration, "tool_call", tool=spec.name, arguments=canonical, output=output),
-                json.dumps({"tool": spec.name, "result": output}, default=str))
 
     sync_usage()
-    return _finish(state, "max_iterations", None, run_store)
+    return await _finish(state, "max_iterations", None, run_store)

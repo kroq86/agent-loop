@@ -232,3 +232,38 @@ hooks.configure(log=my_log_step, bind_trace=my_bind_trace)   # log(trace_id, ste
 ## License
 
 MIT
+
+
+### Async SQLite persistence (0.3.0)
+
+`run_agent`, `resume_agent` and `recover_agent` await the store's `asave`,
+`aload`, `acheckpoint`, `aclaim_for_resume`, `aclaim_orphaned`, and `aaudit`
+operations. Use `await acancel_agent(run_id, store)` from async callers;
+`cancel_agent` and every synchronous store method remain available for sync code.
+Store construction initializes the schema synchronously: construct before serving
+requests, or use `await run_sqlite(SqliteAgentRunStore, path)` during async startup.
+
+`agent_loop.sqlite_io.run_sqlite(callable, *args, **kwargs)` runs a **whole**
+operation on a separate two-thread SQLite pool. Open, commit/rollback and close
+connections inside that callable; never pass a connection or cursor across threads.
+Its admission limit is two submitted operations per event loop. Trace, usage and
+idempotency context variables are copied into the worker. Each call is traced with
+`kind=sqlite` and its operation name when the optional trace integration is installed.
+
+Cancellation (including repeated cancellation while waiting for capacity) waits
+for the operation to finish and close its connection, then propagates. A database
+error takes precedence over cancellation. A completed terminal save is not overwritten
+with `cancelled`; a completed tool observation is recorded before awaiting its audit.
+Cancellation during a resume claim can leave its existing lease to expire, without
+executing the approved tool. No lease, schema or approval CAS policy changes here.
+Drain request tasks before stopping the event loop. Forced loop teardown, process
+crashes and SIGKILL are outside this completion guarantee; SQLite rollback/recovery
+and existing run leases still apply. This does not guarantee every node is under 50 ms
+or remove synchronous CPU work.
+
+Verification: `python -m unittest discover -s tests -v`. Tests use real SQLite
+transactions and held write locks, including queued/repeated cancellation, write
+failure, worker connection lifetime, cancellation during checkpoint/final save/audit,
+and two competing approvals. These are runtime regressions, not a universal refinement
+proof of the durable run protocol. Existing sync APIs remain the matched baseline;
+the SQL statements and serialized state schema are unchanged.

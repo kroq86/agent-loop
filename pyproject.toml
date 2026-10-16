@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-runloop"
-version = "0.2.2"
+version = "0.3.0"
 description = "Explicit, durable agent loop: validated tool calls, human approval, budgets, crash recovery, and composable router / waterfall / parallel / handoff / refine blocks."
 readme = "README.md"
 license = "MIT"
@@ -38,4 +38,4 @@ Issues = "https://github.com/kroq86/agent-loop/issues"
 packages = ["agent_loop"]
 
 [tool.hatch.build.targets.sdist]
-include = ["agent_loop/**", "README.md", "LICENSE"]
+include = ["agent_loop/**", "tests/**", "README.md", "LICENSE"]

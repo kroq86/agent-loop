@@ -19,10 +19,13 @@ side effect is (a key kept in process memory does not survive the crash).
 `tool_audit` takes `subject` and `tenant` from the run's context when the
 caller put them there.
 """
+from contextlib import closing
 import json
 import sqlite3
 import time
 from datetime import datetime, timezone
+
+from agent_loop.sqlite_io import run_sqlite
 
 RESUME_LEASE_S = 120.0
 
@@ -31,7 +34,7 @@ class SqliteAgentRunStore:
     def __init__(self, path: str, resume_lease_s: float = RESUME_LEASE_S):
         self.path = path
         self.resume_lease_s = resume_lease_s
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS agent_runs (
                     run_id TEXT PRIMARY KEY,
@@ -55,7 +58,7 @@ class SqliteAgentRunStore:
         return sqlite3.connect(self.path, timeout=10)
 
     def save(self, run_id: str, status: str, state: dict) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO agent_runs (run_id, status, state, updated_at) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET status = excluded.status, state = excluded.state, "
@@ -64,13 +67,13 @@ class SqliteAgentRunStore:
             )
 
     def load(self, run_id: str) -> tuple[str, dict] | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             row = conn.execute("SELECT status, state FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
         return None if row is None else (row[0], json.loads(row[1]))
 
     def checkpoint(self, run_id: str, state: dict) -> None:
         """Save a running run's state and (re)take its lease -- a heartbeat."""
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO agent_runs (run_id, status, state, updated_at, lease_until) "
                 "VALUES (?, 'running', ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET status = 'running', "
@@ -81,7 +84,7 @@ class SqliteAgentRunStore:
     def claim_orphaned(self, run_id: str) -> bool:
         """running with an expired lease (its process died) -> resuming."""
         now = time.time()
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cur = conn.execute(
                 "UPDATE agent_runs SET status = 'resuming', lease_until = ?, updated_at = ? "
                 "WHERE run_id = ? AND status = 'running' AND lease_until < ?",
@@ -93,7 +96,7 @@ class SqliteAgentRunStore:
         "resuming" run whose lease expired. True only for the one caller
         that won."""
         now = time.time()
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cur = conn.execute(
                 "UPDATE agent_runs SET status = 'resuming', lease_until = ?, updated_at = ? "
                 "WHERE run_id = ? AND (status = 'awaiting_approval' "
@@ -104,7 +107,7 @@ class SqliteAgentRunStore:
 
     def audit(self, state, tool: str, tool_version: str, arguments: dict, status: str,
               duration_s: float, error: str | None) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO tool_audit (at, run_id, trace_id, subject, tenant, tool, tool_version, arguments, "
                 "status, duration_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -114,9 +117,31 @@ class SqliteAgentRunStore:
 
     def cancel_if_waiting(self, run_id: str) -> bool:
         """awaiting_approval -> cancelled, compare-and-set like the claim."""
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cur = conn.execute(
                 "UPDATE agent_runs SET status = 'cancelled', updated_at = ? "
                 "WHERE run_id = ? AND status = 'awaiting_approval'",
                 (datetime.now(timezone.utc).isoformat(), run_id))
             return cur.rowcount == 1
+
+    async def asave(self, run_id: str, status: str, state: dict) -> None:
+        await run_sqlite(self.save, run_id, status, state)
+
+    async def aload(self, run_id: str) -> tuple[str, dict] | None:
+        return await run_sqlite(self.load, run_id)
+
+    async def acheckpoint(self, run_id: str, state: dict) -> None:
+        await run_sqlite(self.checkpoint, run_id, state)
+
+    async def aclaim_orphaned(self, run_id: str) -> bool:
+        return await run_sqlite(self.claim_orphaned, run_id)
+
+    async def aclaim_for_resume(self, run_id: str) -> bool:
+        return await run_sqlite(self.claim_for_resume, run_id)
+
+    async def aaudit(self, state, tool: str, tool_version: str, arguments: dict, status: str,
+                     duration_s: float, error: str | None) -> None:
+        await run_sqlite(self.audit, state, tool, tool_version, arguments, status, duration_s, error)
+
+    async def acancel_if_waiting(self, run_id: str) -> bool:
+        return await run_sqlite(self.cancel_if_waiting, run_id)

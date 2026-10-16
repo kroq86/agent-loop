@@ -14,7 +14,7 @@ from agent_loop.compose import (
 )
 from agent_loop.loop import (
     AgentDecision, AgentResult, AgentStep, Budget, EventSink, FinalCheck, Status, ToolSpec, ToolTimeout,
-    cancel_agent, current_call_id, recover_agent, resume_agent, run_agent, tool_error,
+    acancel_agent, cancel_agent, current_call_id, recover_agent, resume_agent, run_agent, tool_error,
 )
 from agent_loop.runs import SqliteAgentRunStore
 
@@ -26,7 +26,7 @@ except PackageNotFoundError:  # running from a source checkout
 __all__ = [
     "Agent", "AgentDecision", "AgentResult", "AgentStep", "Budget", "Context", "EventSink", "Fallback", "FinalCheck",
     "Handoff", "HandoffNote", "LLMBackend", "LLMClassifier", "LLMCritic", "Outcome", "Parallel", "Refine", "Router",
-    "Sequence", "SqliteAgentRunStore", "Status", "Step", "Timeout", "ToolSpec", "ToolTimeout", "Verdict", "cancel_agent",
+    "Sequence", "SqliteAgentRunStore", "Status", "Step", "Timeout", "ToolSpec", "ToolTimeout", "Verdict", "acancel_agent", "cancel_agent",
     "chain_task", "current_call_id", "hooks", "join_answers", "majority_vote", "recover_agent", "resume_agent",
     "run_agent", "step", "tool_error", "usage",
 ]
