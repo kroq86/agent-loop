@@ -181,7 +181,7 @@ def _tool_catalog(tools: dict[str, ToolSpec]) -> str:
     for spec in tools.values():
         props = spec.args_model.model_json_schema()["properties"]
         example = ", ".join(f'"{name}": {_argument_hint(schema)}' for name, schema in props.items())
-        lines.append(f'- {spec.name} (v{spec.version}): {spec.description} Call as: '
+        lines.append(f'- {spec.name}: {spec.description} Call as: '
                      f'{{"action": "call_tool", "tool": "{spec.name}", "arguments": {{{example}}}}}')
     return "\n".join(lines)
 
