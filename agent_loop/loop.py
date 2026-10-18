@@ -40,7 +40,7 @@ from agent_loop._trace import trace
 from agent_loop.hooks import bind_trace, log_step, new_trace_id
 from agent_loop.prompts import build_system_message
 from agent_loop.runs import SqliteAgentRunStore
-from agent_loop.backend import LLMBackend
+from agent_loop.backend import LLMBackend, estimate_prompt_tokens
 
 MAX_OBSERVATION_CHARS = 4000
 
@@ -112,9 +112,14 @@ Status = Literal["answered", "max_iterations", "rejected_final", "awaiting_appro
 
 @dataclass(frozen=True)
 class Budget:
-    """Hard limits per run, enforced by the loop (not by the model).
+    """Run limits enforced by the loop, carried across saved segments.
     max_iterations bounds model turns; max_tool_calls bounds executed
-    tools; max_tokens bounds prompt+completion tokens actually used;
+    tools; max_tokens is a reported prompt+completion threshold and the
+    remaining amount minus a chars/4 prompt estimate caps each completion
+    via options["num_predict"]. No call starts if that estimate leaves no
+    output budget. This is heuristic admission, not a strict total cap:
+    prompt size is not known before provider reporting, so total usage can
+    exceed the threshold in one call and is checked afterward too.
     max_seconds bounds wall time across all segments of the run."""
     max_iterations: int = 4
     max_tool_calls: int = 6
@@ -565,6 +570,22 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
         if used_seconds() >= budget["max_seconds"]:
             return await out_of_time()
         sync_usage()
+        remaining_tokens = budget["max_tokens"] - state.usage["tokens"]
+        if remaining_tokens <= 0:
+            _record(state, AgentStep(state.iteration, "budget_exceeded",
+                                     detail=f"no token budget left (max_tokens={budget['max_tokens']})"))
+            return await _finish(state, "budget_exceeded", None, run_store)
+        schema = AgentDecision.model_json_schema()
+        estimated_prompt = estimate_prompt_tokens(state.messages, schema)
+        completion_cap = remaining_tokens - estimated_prompt
+        log_step(trace_id, "agent_model_admission", tokens_used=state.usage["tokens"],
+                 remaining_tokens=remaining_tokens, estimated_prompt_tokens=estimated_prompt,
+                 completion_cap=max(0, completion_cap), estimator="chars/4+framing")
+        if completion_cap <= 0:
+            _record(state, AgentStep(state.iteration, "budget_exceeded",
+                                     detail=f"estimated prompt {estimated_prompt} leaves no completion budget "
+                                            f"(remaining={remaining_tokens})"))
+            return await _finish(state, "budget_exceeded", None, run_store)
         if run_store is not None:
             # Checkpoint before every model turn, with a lease: if this
             # process dies, the run stays "running" until the lease expires
@@ -576,8 +597,8 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
             async with asyncio.timeout(budget["max_seconds"] - used_seconds()):
                 raw = await backend.generate(
                     state.messages,
-                    format=AgentDecision.model_json_schema(),
-                    options={"temperature": 0, "seed": 42},
+                    format=schema,
+                    options={"temperature": 0, "seed": 42, "num_predict": completion_cap},
                     trace_id=trace_id,
                 )
         except TimeoutError:

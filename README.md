@@ -36,8 +36,14 @@ Python 3.11+.
   proposed call. `resume_agent(run_id, approved=True|False)` continues
   it, from another request or another process. The approve step is a
   compare-and-set, so two approvals cannot both execute.
-- **Budgets.** Hard limits per run on model turns, executed tool calls,
-  tokens actually used and wall time. They carry across pause and resume.
+- **Budgets.** Limits per run on model turns, executed tool calls,
+  reported tokens and wall time, carried across pause/resume/recovery.
+  Before each model call, the reported remainder reserves a chars/4
+  estimate of the prompt, framing and request schema; the rest is sent as
+  a completion cap. If no output budget remains, the call does not start.
+  The estimate is not a tokenizer or a proven upper bound: the total
+  prompt+completion threshold still has a post-call check. Admission
+  estimates and the cap are logged as `agent_model_admission`.
 - **Crash recovery.** The loop saves a checkpoint to SQLite with a lease
   before every model turn. If the process dies, `recover_agent(run_id)`
   continues from the last checkpoint once the lease expires.
@@ -181,7 +187,9 @@ async def generate(self, messages, format=None, options=None, trace_id=None) -> 
 
 `format` is a JSON schema the reply must follow. A backend should report
 tokens with `agent_loop.usage.add(prompt, completion)`, or `max_tokens`
-is not enforced. Two are included.
+is not enforced. It must honour a positive `options["num_predict"]` as a
+completion cap (or use a smaller cap), without changing caller options.
+The cap does not reserve or predict input tokens. Two backends are included.
 
 **OpenAI-compatible APIs** (`pip install "agent-runloop[openai]"`): OpenAI,
 Azure OpenAI, and servers that speak the same protocol (vLLM, LM Studio,

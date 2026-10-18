@@ -161,7 +161,15 @@ class OpenAIBackend:
                                                           "schema": format}}
         elif format and self.structured != "none":
             payload["response_format"] = {"type": "json_object"}
-        return {**payload, **self.extra_body}
+        out = {**payload, **self.extra_body}
+        caps = [(options or {}).get(key) for key in ("num_predict", "max_tokens")]
+        caps = [cap for cap in caps if cap is not None]
+        if caps:
+            # Deployment extras may tighten, never undo the caller's cap.
+            for field in ("max_tokens", "max_completion_tokens"):
+                if field in out:
+                    out[field] = min(out[field], *caps)
+        return out
 
     @trace
     async def generate(self, messages: list[dict], format: str | dict | None = None,
