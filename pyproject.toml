@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-runloop"
-version = "0.3.1"
+version = "0.3.2"
 description = "Explicit, durable agent loop: validated tool calls, human approval, budgets, crash recovery, and composable router / waterfall / parallel / handoff / refine blocks."
 readme = "README.md"
 license = "MIT"

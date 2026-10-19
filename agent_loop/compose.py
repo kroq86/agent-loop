@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 from agent_loop._trace import trace
 from agent_loop.backend import LLMBackend
 from agent_loop.hooks import bind_trace, log_step, new_trace_id
-from agent_loop.loop import AgentResult, Budget, FinalCheck, ToolSpec, run_agent
+from agent_loop.loop import AgentResult, Budget, FinalCheck, Obligation, ToolSpec, run_agent
 from agent_loop.runs import SqliteAgentRunStore
 
 
@@ -119,9 +119,11 @@ class Agent(_Block):
     def __init__(self, name: str, instructions: str, tools: list[ToolSpec] | None = None, *,
                  backend: LLMBackend | None = None, budget: Budget | None = None,
                  final_check: FinalCheck | None = None,
-                 prefetch: Callable[[str], list[tuple[str, dict]]] | None = None):
+                 prefetch: Callable[[str], list[tuple[str, dict]]] | None = None,
+                 obligation: Obligation | None = None):
         self.name, self.instructions, self.tools = name, instructions, list(tools or [])
         self.backend, self.budget, self.final_check, self.prefetch = backend, budget, final_check, prefetch
+        self.obligation = obligation
 
     @trace
     async def run(self, task: str, ctx: Context) -> Outcome:
@@ -129,7 +131,8 @@ class Agent(_Block):
             task, self.instructions, self.tools, backend=self.backend or ctx.backend,
             trace_id=ctx.trace_id, final_check=self.final_check, run_store=ctx.run_store,
             context={**ctx.context, "agent_role": self.name}, budget=self.budget or Budget(),
-            events=ctx.events, prefetch=self.prefetch(task) if self.prefetch else None)
+            events=ctx.events, prefetch=self.prefetch(task) if self.prefetch else None,
+            obligation=self.obligation)
         return Outcome(result.status, result.answer, [result], {"agent": self.name})
 
 
@@ -321,7 +324,8 @@ class Handoff(_Block):
     async def run(self, task: str, ctx: Context) -> Outcome:
         source = Agent(self.source.name, self.source.instructions, self.source.tools + self._tools(),
                        backend=self.source.backend, budget=self.source.budget,
-                       final_check=self.source.final_check, prefetch=self.source.prefetch)
+                       final_check=self.source.final_check, prefetch=self.source.prefetch,
+                       obligation=self.source.obligation)
         first = await source(task, ctx)
         steps = first.runs[-1].steps if first.runs else []
         call = next((s for s in steps if s.kind == "tool_call" and (s.tool or "").startswith("handoff_to_")), None)

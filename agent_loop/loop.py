@@ -10,8 +10,11 @@ The model never calls anything. On every iteration it returns one JSON
 
 Every rejection (bad JSON, unknown tool, bad arguments, duplicate call,
 tool exception) becomes an observation the model sees on the next turn;
-none of them execute anything. The loop stops on a final answer or at
-`max_iterations`, whichever comes first.
+none of them execute anything. A caller obligation that is still unmet
+does the same for `final`: the reason is shown and the loop continues.
+The loop stops on an accepted final answer, a rejected final answer, or
+at `max_iterations`, whichever comes first. Iterations that end with an
+obligation still unmet finish as `obligation_unmet`, not `answered`.
 
 Write tools (`writes=True`) never execute on the model's word. A valid
 write call pauses the run: state is saved to a run store, the result is
@@ -91,7 +94,7 @@ class AgentStep:
         "tool_call", "final", "invalid_json", "invalid_decision",
         "unknown_tool", "invalid_arguments", "duplicate_call", "tool_error", "final_rejected",
         "approval_requested", "human_rejected", "model_error", "budget_exceeded", "timeout", "cancelled",
-        "not_permitted", "precondition_failed",
+        "not_permitted", "precondition_failed", "completion_refused",
     ]
     tool: str | None = None
     arguments: dict[str, Any] | None = None
@@ -105,9 +108,13 @@ class AgentStep:
 # tool results) is the caller's policy.
 FinalCheck = Callable[[str, list[str], list["AgentStep"]], str | None]
 
+# (steps) -> why `final` is not allowed yet, or None. The loop stays
+# task-agnostic: the caller decides which tool must already have succeeded.
+Obligation = Callable[[list["AgentStep"]], str | None]
+
 
 Status = Literal["answered", "max_iterations", "rejected_final", "awaiting_approval", "model_unavailable",
-                 "budget_exceeded", "timeout", "cancelled"]
+                 "budget_exceeded", "timeout", "cancelled", "obligation_unmet"]
 
 
 @dataclass(frozen=True)
@@ -332,6 +339,7 @@ async def run_agent(
     budget: Budget | None = None,
     events: asyncio.Queue | None = None,
     prefetch: list[tuple[str, dict]] | None = None,
+    obligation: Obligation | None = None,
 ) -> AgentResult:
     """`prefetch`: read-tool calls the APPLICATION makes before the first
     model turn (deterministic retrieval), e.g. [("search_knowledge_base",
@@ -367,7 +375,7 @@ async def run_agent(
                 _emit(state, {"event": "started", "run_id": state.run_id})
                 for tool_name, arguments in prefetch or []:
                     await _prefetch(state, registry, tool_name, arguments, run_store)
-                return await _drive(state, registry, backend, final_check, run_store)
+                return await _drive(state, registry, backend, final_check, run_store, obligation)
     finally:
         _events.reset(token)
 
@@ -381,6 +389,7 @@ async def resume_agent(
     backend: LLMBackend,
     final_check: FinalCheck | None = None,
     events: asyncio.Queue | None = None,
+    obligation: Obligation | None = None,
 ) -> AgentResult:
     """Continue a run paused at awaiting_approval. Raises LookupError for
     an unknown run and RuntimeError if the run is not (or no longer)
@@ -420,7 +429,7 @@ async def resume_agent(
                                              arguments=pending["arguments"], detail="rejected by human"),
                             f"A human reviewer rejected the {spec.name} call; it was not executed. "
                             "Do not propose it again. Tell the user it was not done.")
-                return await _drive(state, registry, backend, final_check, run_store)
+                return await _drive(state, registry, backend, final_check, run_store, obligation)
     finally:
         _events.reset(token)
 
@@ -432,6 +441,7 @@ async def recover_agent(
     run_store: SqliteAgentRunStore,
     backend: LLMBackend,
     final_check: FinalCheck | None = None,
+    obligation: Obligation | None = None,
 ) -> AgentResult:
     """Continue a run whose process died mid-run (status "running", lease
     expired) from its last checkpoint. RuntimeError if it is not orphaned
@@ -445,7 +455,7 @@ async def recover_agent(
         async with _persist_cancellation(state, run_store):
             log_step(state.trace_id, "agent_recovered", run_id=run_id, from_iteration=state.iteration,
                      usage=state.usage)
-            return await _drive(state, _registry(tools), backend, final_check, run_store)
+            return await _drive(state, _registry(tools), backend, final_check, run_store, obligation)
 
 
 async def _prefetch(state: "_RunState", registry: dict[str, ToolSpec], tool_name: str, arguments: dict,
@@ -531,7 +541,8 @@ async def _finish(state: _RunState, status: Status, answer: str | None,
 
 
 async def _drive(state: _RunState, registry: dict[str, ToolSpec], backend: LLMBackend,
-                 final_check: FinalCheck | None, run_store: SqliteAgentRunStore | None) -> AgentResult:
+                 final_check: FinalCheck | None, run_store: SqliteAgentRunStore | None,
+                 obligation: Obligation | None = None) -> AgentResult:
     """One segment of a run (start, or after an approval). Budgets carry
     across segments: tokens, tool calls and seconds already used count."""
     segment_start = time.monotonic()
@@ -540,7 +551,7 @@ async def _drive(state: _RunState, registry: dict[str, ToolSpec], backend: LLMBa
     with usage.metered() as meter:
         try:
             return await _drive_segment(state, registry, backend, final_check, run_store, meter,
-                                        segment_start, seconds_before, tokens_before)
+                                        segment_start, seconds_before, tokens_before, obligation)
         except _FinishedDuringCancellation:
             raise
         except asyncio.CancelledError:
@@ -550,7 +561,8 @@ async def _drive(state: _RunState, registry: dict[str, ToolSpec], backend: LLMBa
 
 
 async def _drive_segment(state, registry, backend, final_check, run_store, meter,
-                         segment_start, seconds_before, tokens_before) -> AgentResult:
+                         segment_start, seconds_before, tokens_before,
+                         obligation: Obligation | None = None) -> AgentResult:
     trace_id = state.trace_id
     budget = state.budget
 
@@ -634,6 +646,13 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
             continue
 
         if decision.action == "final":
+            unmet = obligation(state.steps) if obligation else None
+            if unmet:
+                # The required tool has not succeeded. Show the reason and
+                # keep the same loop; do not invent the tool arguments.
+                _record(state, AgentStep(iteration, "completion_refused", detail=unmet),
+                        tool_error("completion_refused", unmet))
+                continue
             rejection = final_check(decision.answer, decision.citations, state.steps) if final_check else None
             if rejection is not None:
                 # Not fed back for another try: a rejected answer ends the
@@ -716,4 +735,7 @@ async def _drive_segment(state, registry, backend, final_check, run_store, meter
 
 
     sync_usage()
+    unmet = obligation(state.steps) if obligation else None
+    if unmet:
+        return await _finish(state, "obligation_unmet", None, run_store)
     return await _finish(state, "max_iterations", None, run_store)
