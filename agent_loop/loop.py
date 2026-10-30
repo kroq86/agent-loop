@@ -45,7 +45,10 @@ from agent_loop.prompts import build_system_message
 from agent_loop.runs import SqliteAgentRunStore
 from agent_loop.backend import LLMBackend, estimate_prompt_tokens
 
-MAX_OBSERVATION_CHARS = 4000
+# The direct answers this loop sits beside show the model about 4000
+# characters of passage text; a JSON tool result carries ids, scores and
+# escapes around the same text, so the observation budget is twice that.
+MAX_OBSERVATION_CHARS = 8000
 
 
 class AgentDecision(BaseModel):
@@ -214,14 +217,46 @@ def _system_message(instructions: str, tools: dict[str, ToolSpec]) -> dict:
     )
 
 
+def fit_observation(payload: str, limit: int = MAX_OBSERVATION_CHARS) -> tuple[str, dict | None]:
+    """The payload the model sees, and what was left out (None: nothing).
+
+    A tool result is never cut inside a value: a JSON result with a
+    "result" list keeps whole items, in order, while they fit, and says how
+    many it left out in "omitted_results". Before, the first 4000
+    characters were sent as is: the JSON broke mid-item and the items after
+    the cut vanished without a sign (a search's 8th hit, which held the
+    answer). Any other payload is cut with a note that names how much is
+    missing."""
+    if len(payload) <= limit:
+        return payload, None
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("result"), list):
+        items = data["result"]
+        kept: list = []
+        for item in items:
+            trial = json.dumps({**data, "result": kept + [item], "omitted_results": len(items) - len(kept) - 1},
+                               default=str)
+            if len(trial) > limit:
+                break
+            kept.append(item)
+        text = json.dumps({**data, "result": kept, "omitted_results": len(items) - len(kept)}, default=str)
+        if len(text) <= limit:
+            return text, {"kept_items": len(kept), "omitted_items": len(items) - len(kept),
+                          "payload_chars": len(payload), "limit": limit}
+    note = f"\n[observation cut: the first {limit} of {len(payload)} characters are shown; the rest is missing]"
+    return payload[:limit] + note, {"kept_chars": limit, "payload_chars": len(payload), "limit": limit}
+
+
 def _observation(payload: str, task: str) -> dict:
     """Tool output and loop errors go back to the model delimited and
     labelled as data, with the original task restated right after it (a
     "sandwich" defense). Without the restated task, 2 of 4 prompt-injection
     payloads placed in tool results made llama3.2:3b answer with the
-    injected word; with it, all 4 were resisted."""
-    if len(payload) > MAX_OBSERVATION_CHARS:
-        payload = payload[:MAX_OBSERVATION_CHARS] + "...[truncated]"
+    injected word; with it, all 4 were resisted. The payload is already
+    fitted (fit_observation)."""
     return {
         "role": "user",
         "content": (
@@ -498,7 +533,12 @@ def _record(state: _RunState, step: AgentStep, observation: str | None = None) -
     _emit(state, {"event": "step", "kind": step.kind, "iteration": step.iteration, "tool": step.tool,
                   "arguments": step.arguments, "detail": step.detail})
     if observation is not None:
-        state.messages.append(_observation(observation, state.task))
+        shown, cut = fit_observation(observation)
+        if cut is not None:
+            log_step(state.trace_id, "observation_truncated", run_id=state.run_id, iteration=step.iteration,
+                     tool=step.tool, **cut)
+            _emit(state, {"event": "observation_truncated", "tool": step.tool, **cut})
+        state.messages.append(_observation(shown, state.task))
 
 
 @asynccontextmanager
